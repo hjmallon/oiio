@@ -37,4 +37,5 @@ ref/IMG_7702_small.heic :  512 x  300, 3 channel, uint8 heif
     Exif:SubsecTimeDigitized: "006"
     Exif:SubsecTimeOriginal: "006"
     Exif:WhiteBalance: 0 (auto)
+    oiio:BitsPerSample: 8
     oiio:ColorSpace: "sRGB"

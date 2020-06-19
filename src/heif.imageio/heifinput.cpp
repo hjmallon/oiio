@@ -6,6 +6,7 @@
 #include <OpenImageIO/tiffutils.h>
 
 #include <libheif/heif_cxx.h>
+#include <libheif/heif_version.h>
 
 
 // This plugin utilises libheif:
@@ -42,11 +43,15 @@ private:
     int m_subimage      = -1;
     int m_num_subimages = 0;
     int m_has_alpha     = false;
+    int m_bitspersample = 8;
     std::unique_ptr<heif::Context> m_ctx;
     heif_item_id m_primary_id;             // id of primary image
     std::vector<heif_item_id> m_item_ids;  // ids of all other images
     heif::ImageHandle m_ihandle;
     heif::Image m_himage;
+
+    // Fix unusual bit depths
+    void fix_bitdepth(void* data, int nvals);
 };
 
 
@@ -177,8 +182,31 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         auto id     = (subimage == 0) ? m_primary_id : m_item_ids[subimage - 1];
         m_ihandle   = m_ctx->get_image_handle(id);
         m_has_alpha = m_ihandle.has_alpha_channel();
-        auto chroma = m_has_alpha ? heif_chroma_interleaved_RGBA
-                                  : heif_chroma_interleaved_RGB;
+        m_bitspersample = 8;
+        heif_chroma chroma;
+
+        // This function was never added to the heif_cxx.h, hence workaround
+#if LIBHEIF_NUMERIC_VERSION > 0x010400
+        int depth_chroma = heif_image_handle_get_chroma_bits_per_pixel(m_ihandle.get_raw_image_handle());
+        int depth_luma = heif_image_handle_get_luma_bits_per_pixel(m_ihandle.get_raw_image_handle());
+        if (depth_chroma > 8 || depth_luma > 8) {
+            if (littleendian()) {
+                chroma = m_has_alpha ? heif_chroma_interleaved_RRGGBBAA_LE
+                                     : heif_chroma_interleaved_RRGGBB_LE;
+            } else {
+                chroma = m_has_alpha ? heif_chroma_interleaved_RRGGBBAA_BE
+                                     : heif_chroma_interleaved_RRGGBB_BE;
+            }
+
+            m_bitspersample = std::max(depth_chroma, depth_luma);
+        }
+        else
+#endif
+        {
+            chroma = m_has_alpha ? heif_chroma_interleaved_RGB
+                                 : heif_chroma_interleaved_RGBA;
+        }
+
         m_himage = m_ihandle.decode_image(heif_colorspace_RGB, chroma);
 
     } catch (const heif::Error& err) {
@@ -191,11 +219,11 @@ HeifInput::seek_subimage(int subimage, int miplevel)
         return false;
     }
 
-    int bits = m_himage.get_bits_per_pixel(heif_channel_interleaved);
-    m_spec = ImageSpec(m_ihandle.get_width(), m_ihandle.get_height(), bits / 8,
-                       TypeUInt8);
+    m_spec = ImageSpec(m_ihandle.get_width(), m_ihandle.get_height(), m_has_alpha ? 4 : 3,
+                       m_bitspersample > 8 ? TypeUInt16 : TypeUInt8);
 
     m_spec.attribute("oiio:ColorSpace", "sRGB");
+    m_spec.attribute("oiio:BitsPerSample", m_bitspersample);
 
     auto meta_ids = m_ihandle.get_list_of_metadata_block_IDs();
     // std::cout << "nmeta? " << meta_ids.size() << "\n";
@@ -253,8 +281,32 @@ HeifInput::read_native_scanline(int subimage, int miplevel, int y, int /*z*/,
     }
     hdata += (y - m_spec.y) * ystride;
     memcpy(data, hdata, m_spec.width * m_spec.pixel_bytes());
+
+    if (spec().format.size() * 8 != m_bitspersample) {
+        size_t scanline_vals = spec().width * spec().nchannels;
+        fix_bitdepth(data, scanline_vals);
+    }
     return true;
 }
 
+
+
+void
+HeifInput::fix_bitdepth(void* data, int nvals)
+{
+    OIIO_DASSERT(spec().format.size() * 8 != m_bitspersample);
+
+    if (spec().format == TypeDesc::UINT16 && m_bitspersample == 10) {
+        unsigned short* v = (unsigned short*)data;
+        for (int i = 0; i < nvals; ++i)
+            v[i] = bit_range_convert<10, 16>(v[i]);
+    } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 12) {
+        unsigned short* v = (unsigned short*)data;
+        for (int i = 0; i < nvals; ++i)
+            v[i] = bit_range_convert<12, 16>(v[i]);
+    } else {
+        OIIO_ASSERT(0 && "unsupported bit conversion -- shouldn't reach here");
+    }
+}
 
 OIIO_PLUGIN_NAMESPACE_END
