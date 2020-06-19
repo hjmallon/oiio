@@ -8,6 +8,7 @@
 #include <OpenImageIO/tiffutils.h>
 
 #include <libheif/heif_cxx.h>
+#include <libheif/heif_version.h>
 
 
 OIIO_PLUGIN_NAMESPACE_BEGIN
@@ -38,6 +39,19 @@ private:
     heif::Encoder m_encoder { heif_compression_HEVC };
     std::vector<unsigned char> scratch;
     std::vector<unsigned char> m_tilebuffer;
+    int m_bitspersample;
+
+    // Fix unusual bit depths
+    void fix_bitdepth(void* data, int nvals);
+
+    // Move data to scratch area if not already there.
+    void* move_to_scratch(const void* data, size_t nbytes)
+    {
+        if (scratch.empty() || (const unsigned char*)data != scratch.data())
+            scratch.assign((const unsigned char*)data,
+                           (const unsigned char*)data + nbytes);
+        return scratch.data();
+    }
 };
 
 
@@ -96,8 +110,6 @@ HeifOutput::open(const std::string& name, const ImageSpec& newspec,
     m_filename = name;
     // Save spec for later used
     m_spec = newspec;
-    // heif always behaves like floating point
-    m_spec.set_format(TypeDesc::FLOAT);
 
     // Check for things heif can't support
     if (m_spec.nchannels != 1 && m_spec.nchannels != 3
@@ -117,19 +129,65 @@ HeifOutput::open(const std::string& name, const ImageSpec& newspec,
         return false;
     }
 
-    m_spec.set_format(TypeUInt8);  // Only uint8 for now
+    m_bitspersample = m_spec.get_int_attribute("oiio:BitsPerSample");
+    heif_chroma chroma;
 
-    try {
-        m_ctx.reset(new heif::Context);
-        m_himage = heif::Image();
+// e.g. heif_chroma_interleaved_RRGGBBAA_LE introduced in 1.4.0
+#if LIBHEIF_NUMERIC_VERSION > 0x010400
+    if (heif_get_version_number() >= 0x010602 &&
+        m_spec.format.basetype == TypeDesc::UINT16)
+    {
+        if (m_bitspersample != 10 && m_bitspersample != 12)
+            m_bitspersample = 12;
+
+        if (littleendian())
+        {
+            static heif_chroma chromas[/*nchannels*/]
+                = { heif_chroma_undefined, heif_chroma_undefined,
+                    heif_chroma_undefined, heif_chroma_interleaved_RRGGBB_LE,
+                    heif_chroma_interleaved_RRGGBBAA_LE };
+            chroma = chromas[m_spec.nchannels];
+        }
+        else
+        {
+            static heif_chroma chromas[/*nchannels*/]
+                = { heif_chroma_undefined, heif_chroma_undefined,
+                    heif_chroma_undefined, heif_chroma_interleaved_RRGGBB_BE,
+                    heif_chroma_interleaved_RRGGBBAA_BE };
+            chroma = chromas[m_spec.nchannels];
+        }
+    }
+    else
+#endif
+    {
+        // Everything else -- default to 8 bit
+        m_bitspersample = 8;
         static heif_chroma chromas[/*nchannels*/]
             = { heif_chroma_undefined, heif_chroma_monochrome,
                 heif_chroma_undefined, heif_chroma_interleaved_RGB,
                 heif_chroma_interleaved_RGBA };
+        chroma = chromas[m_spec.nchannels];
+        m_spec.set_format(TypeDesc::UINT8);
+    }
+
+    try {
+        m_ctx.reset(new heif::Context);
+        m_himage = heif::Image();
+
         m_himage.create(newspec.width, newspec.height, heif_colorspace_RGB,
-                        chromas[m_spec.nchannels]);
-        m_himage.add_plane(heif_channel_interleaved, newspec.width,
-                           newspec.height, 8 * m_spec.nchannels /*bit depth*/);
+                        chroma);
+        // NB: API changed in 1.5.0 to bits per component, but with 24 & 32 supported
+        // for some backwards compatibility (old code, new lib). However we also
+        // want to support new code, old lib.
+        if (heif_get_version_number() < 0x010500) {
+            OIIO_ASSERT(m_bitspersample == 8);
+            m_himage.add_plane(heif_channel_interleaved, newspec.width,
+                           newspec.height, m_bitspersample * m_spec.nchannels);
+        } else {
+            m_himage.add_plane(heif_channel_interleaved, newspec.width,
+                           newspec.height, m_bitspersample);
+        }
+
         m_encoder = heif::Encoder(heif_compression_HEVC);
 
     } catch (const heif::Error& err) {
@@ -156,8 +214,16 @@ bool
 HeifOutput::write_scanline(int y, int /*z*/, TypeDesc format, const void* data,
                            stride_t xstride)
 {
-    data           = to_native_scanline(format, data, xstride, scratch);
-    int hystride   = 0;
+    data = to_native_scanline(format, data, xstride, scratch);
+
+    // Handle weird bit depths
+    if (spec().format.size() * 8 != m_bitspersample) {
+        size_t scanline_vals = spec().width * spec().nchannels;
+        data = move_to_scratch(data, scanline_vals * spec().format.size());
+        fix_bitdepth(scratch.data(), scanline_vals);
+    }
+
+    int hystride = 0;
     uint8_t* hdata = m_himage.get_plane(heif_channel_interleaved, &hystride);
     hdata += hystride * (y - m_spec.y);
     memcpy(hdata, data, hystride);
@@ -188,6 +254,12 @@ HeifOutput::close()
     if (m_spec.tile_width) {
         // We've been emulating tiles; now dump as scanlines.
         OIIO_ASSERT(m_tilebuffer.size());
+
+        // Handle weird bit depths
+        if (spec().format.size() * 8 != m_bitspersample) {
+            fix_bitdepth(m_tilebuffer.data(), spec().image_pixels());
+        }
+
         ok &= write_scanlines(m_spec.y, m_spec.y + m_spec.height, 0,
                               m_spec.format, &m_tilebuffer[0]);
         std::vector<unsigned char>().swap(m_tilebuffer);
@@ -240,6 +312,26 @@ HeifOutput::close()
 
     m_ctx.reset();
     return ok;
+}
+
+
+
+void
+HeifOutput::fix_bitdepth(void* data, int nvals)
+{
+    OIIO_DASSERT(spec().format.size() * 8 != m_bitspersample);
+
+    if (spec().format == TypeDesc::UINT16 && m_bitspersample == 10) {
+        unsigned short* v = (unsigned short*)data;
+        for (int i = 0; i < nvals; ++i)
+            v[i] = bit_range_convert<16, 10>(v[i]);
+    } else if (spec().format == TypeDesc::UINT16 && m_bitspersample == 12) {
+        unsigned short* v = (unsigned short*)data;
+        for (int i = 0; i < nvals; ++i)
+            v[i] = bit_range_convert<16, 12>(v[i]);
+    } else {
+        OIIO_ASSERT(0 && "unsupported bit conversion -- shouldn't reach here");
+    }
 }
 
 OIIO_PLUGIN_NAMESPACE_END
